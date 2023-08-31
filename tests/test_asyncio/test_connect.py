@@ -239,18 +239,36 @@ async def _assert_connect(conn, server_address, certfile=None, keyfile=None):
 
 
 async def _redis_request_handler(reader, writer, stop_event):
-    buffer = b""
     command = None
     command_ptr = None
     fragment_length = None
+
+    # create initial parser
+    parser = resp_parse(buffer)
+    parsed = parser.send(None)
+    assert parsed is None
+    
     while not stop_event.is_set() or buffer:
         _logger.info(str(stop_event.is_set()))
-        try:
-            buffer += await asyncio.wait_for(reader.read(1024), timeout=0.5)
-        except TimeoutError:
-            continue
-        if not buffer:
-            continue
+        if parsed is None:
+            try:
+                buffer = await asyncio.wait_for(reader.read(1024), timeout=0.5)
+            except TimeoutError:
+                continue
+            parsed = parser.send(buffer)
+            if parsed is None:
+                continue
+        
+        # got command. Extract it, process it, create new parser
+        item, rest = parsed
+        parser.close()
+        process_command(item)
+        
+        parser = resp_parse(rest)
+        parsed = parser.send(None)
+        
+
+
         parts = re.split(_CMD_SEP, buffer)
         buffer = parts[-1]
         for fragment in parts[:-1]:
@@ -286,3 +304,51 @@ async def _redis_request_handler(reader, writer, stop_event):
             await writer.drain()
             command = None
     _logger.info("Exit handler")
+
+
+from contextlib import closing
+def resp_parse(buffer):
+    """
+    A generator based rest parser.  Yields an individual data item, plust a rest.
+    Is fed data with generator.send()
+    """
+    # wait for start token
+    while _CMD_SEP not in buffer:
+        buffer += yield None
+    cmd, rest = buffer.split(_CMD_SEP, 1)
+    
+    code = cmd[0]
+    # only support arrays and strings
+    if code == b"*":  # array
+        count = int(cmd[1:])
+        result = []
+        for i in range(count):
+            # recursively parse the next array item
+            with closing(resp_parse(rest)) as parser:
+                parsed = parser.send(None)
+                while parsed is None:
+                    input = yield None
+                    parsed = parser.send(input)
+            value, rest = parsed
+            result.append(value)
+        yield result, rest
+        return
+    
+    if code == b"$":  # bulk string
+        count = int(cmd[1:])
+        expect = count + 2
+        while len(rest) < expect:
+            rest += yield(None)
+        result = rest[:count]
+        rest = rest[count+2:]
+        yield result, rest
+        return
+    
+    if code == b"+":  # simple string
+        count = int(cmd[1:])
+        while _CMD_SEP not in rest:
+            rest += yield(None)
+        result, rest = rest.split(_CMD_SEP, 1)
+        yield result, rest
+        return
+            
